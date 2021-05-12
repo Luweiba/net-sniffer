@@ -38,6 +38,10 @@ impl IFace {
     pub fn get_index(&self) -> u32 {
         self.index
     }
+
+    pub fn change_name(&mut self, name: String) {
+        self.name = name;
+    }
 }
 
 struct PacketInfo {

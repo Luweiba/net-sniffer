@@ -7,6 +7,7 @@ use serde::{Deserialize, Serialize};
 use std::cell::{Cell, RefCell};
 use std::sync::Arc;
 use net_sniffer::sniffer::IFace;
+use std::borrow::{Borrow, BorrowMut};
 
 #[derive(Debug, Serialize, Deserialize)]
 struct MyObj {
@@ -62,8 +63,8 @@ async fn index_mjsonrust(body: web::Bytes) -> Result<HttpResponse, Error> {
 }
 
 #[get("/iface_get")]
-async fn iface_get(data: web::Data<MyData>) -> Result<HttpResponse, Error> {
-
+async fn iface_get(mut data: web::Data<MyData>) -> Result<HttpResponse, Error> {
+    data.iface.borrow_mut().change_name("eth2".to_string());
     Ok(HttpResponse::Ok()
         .content_type("application/json")
         .body(json::object! {
@@ -73,7 +74,7 @@ async fn iface_get(data: web::Data<MyData>) -> Result<HttpResponse, Error> {
 }
 
 struct MyData {
-    iface: Arc<RefCell<IFace>>,
+    iface: RefCell<IFace>,
 }
 
 #[actix_web::main]
@@ -84,7 +85,7 @@ async fn main() -> std::io::Result<()> {
     HttpServer::new(|| {
         App::new()
             // enable logger
-            .data(MyData{ iface: Arc::new(RefCell::new(IFace::new("eth0".to_string(), 1)))})
+            .data(MyData{ iface: RefCell::new(IFace::new("eth0".to_string(), 1))})
             .wrap(middleware::Logger::default())
             .wrap(middleware::DefaultHeaders::new().header("Access-Control-Allow-Origin", "*"))
             .data(web::JsonConfig::default().limit(4096)) // <- limit size of the payload (global configuration)
