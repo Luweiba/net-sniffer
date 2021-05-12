@@ -62,13 +62,13 @@ async fn index_mjsonrust(body: web::Bytes) -> Result<HttpResponse, Error> {
 }
 
 #[get("/iface_get")]
-async fn iface_get() -> Result<HttpResponse, Error> {
+async fn iface_get(data: web::Data<MyData>) -> Result<HttpResponse, Error> {
 
     Ok(HttpResponse::Ok()
         .content_type("application/json")
         .body(json::object! {
-            "Name": "Luweiba",
-            "Gender": "Male"
+            "Name": data.iface.borrow().get_name(),
+            "index": data.iface.borrow().get_index()
         }.dump()))
 }
 
