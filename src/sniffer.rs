@@ -14,12 +14,18 @@ use pnet::util::MacAddr;
 use pnet::datalink::Channel::Ethernet;
 
 
+use std::thread;
+
 
 use std::net::IpAddr;
 use std::error::Error;
 use std::sync::Arc;
 use std::sync::Mutex;
+use std::time::Duration;
+use std::sync::atomic::{AtomicBool, Ordering};
 
+
+const MAX_PACKET_NUM: usize = 1500;
 
 pub struct IFace {
     name: String,
@@ -44,7 +50,8 @@ impl IFace {
     }
 }
 
-struct PacketInfo {
+#[derive(Clone)]
+pub struct PacketInfo {
     iface_name: String,
     timestamp: u32,
     source: String,
@@ -68,18 +75,24 @@ impl PacketInfo {
             length
         }
     }
+
+    pub fn get_inner(self) -> (String, u32, String, String, String, u32, String, Vec<u8>) {
+        (self.iface_name, self.timestamp, self.source, self.destination, self.protocol, self.length, self.description, self.raw_bytes)
+    }
 }
 
 pub struct Sniffer {
     interfaces: Vec<NetworkInterface>,
-    packet_info_buffer: Arc<Mutex<Vec<PacketInfo>>>
+    packet_info_buffer: Arc<Mutex<Vec<PacketInfo>>>,
+    stop_signal: Arc<AtomicBool>,
 }
 
 impl Sniffer {
     pub fn new() -> Self {
         Self {
             interfaces: datalink::interfaces(),
-            packet_info_buffer: Arc::new(Mutex::new(vec![]))
+            packet_info_buffer: Arc::new(Mutex::new(vec![])),
+            stop_signal: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -87,60 +100,82 @@ impl Sniffer {
         self.interfaces.iter().map(|x| IFace::new(x.name.clone(), x.index)).collect()
     }
 
+    pub fn packet_update(&mut self) -> Vec<PacketInfo> {
+        let new_packet_info;
+        {
+            let mut buffer_lock = self.packet_info_buffer.lock().unwrap();
+            new_packet_info = buffer_lock.to_vec();
+            buffer_lock.clear();
+        }
+        new_packet_info
+    }
+
+    pub fn packet_update_stop(&mut self) -> bool {
+        self.stop_signal.fetch_xor(true, Ordering::SeqCst)
+    }
+
     pub fn start_sniffing(&self, index: u32) -> Result<(), Box<dyn Error>> {
-        let interface = self.interfaces.iter().find(|x| x.index == index).unwrap();
+        let interface = self.interfaces.iter().find(|x| x.index == index).unwrap().clone();
         // Create a channel to receive on
-        let (_, mut rx) = match datalink::channel(interface, Default::default()) {
+        let (_, mut rx) = match datalink::channel(&interface, Default::default()) {
             Ok(Ethernet(tx, rx)) => (tx, rx),
             Ok(_) => panic!("packetdump: unhandled channel type: {}"),
             Err(e) => panic!("packetdump: unable to create channel: {}", e),
         };
-
-        loop {
-            let mut buf: [u8; 1600] = [0u8; 1600];
-            let mut fake_ethernet_frame = MutableEthernetPacket::new(&mut buf[..]).unwrap();
-            match rx.next() {
-                Ok(packet) => {
-                    let payload_offset;
-                    if cfg!(any(target_os = "macos", target_os = "ios"))
-                        && interface.is_up()
-                        && !interface.is_broadcast()
-                        && ((!interface.is_loopback() && interface.is_point_to_point())
-                        || interface.is_loopback())
-                    {
-                        if interface.is_loopback() {
-                            // The pnet code for BPF loopback adds a zero d out Ethernet header
-                            payload_offset = 14;
-                        } else {
-                            // Maybe is TUN interface
-                            payload_offset = 0;
-                        }
-                        if packet.len() > payload_offset {
-                            let version = Ipv4Packet::new(&packet[payload_offset..])
-                                .unwrap()
-                                .get_version();
-                            if version == 4 {
-                                fake_ethernet_frame.set_destination(MacAddr(0, 0, 0, 0, 0, 0));
-                                fake_ethernet_frame.set_source(MacAddr(0, 0, 0, 0, 0, 0));
-                                fake_ethernet_frame.set_ethertype(EtherTypes::Ipv4);
-                                fake_ethernet_frame.set_payload(&packet[payload_offset..]);
-                                handle_ethernet_frame(interface, &fake_ethernet_frame.to_immutable(), self.packet_info_buffer.clone());
-                                continue;
-                            } else if version == 6 {
-                                fake_ethernet_frame.set_destination(MacAddr(0, 0, 0, 0, 0, 0));
-                                fake_ethernet_frame.set_source(MacAddr(0, 0, 0, 0, 0, 0));
-                                fake_ethernet_frame.set_ethertype(EtherTypes::Ipv6);
-                                fake_ethernet_frame.set_payload(&packet[payload_offset..]);
-                                handle_ethernet_frame(interface, &fake_ethernet_frame.to_immutable(), self.packet_info_buffer.clone());
-                                continue;
+        let packet_info_buffer = self.packet_info_buffer.clone();
+        let stop_signal = self.stop_signal.clone();
+        thread::spawn(move || {
+            for _ in 0..100 {
+                let mut buf: [u8; 1600] = [0u8; 1600];
+                let mut fake_ethernet_frame = MutableEthernetPacket::new(&mut buf[..]).unwrap();
+                match rx.next() {
+                    Ok(packet) => {
+                        let payload_offset;
+                        if cfg!(any(target_os = "macos", target_os = "ios"))
+                            && interface.is_up()
+                            && !interface.is_broadcast()
+                            && ((!interface.is_loopback() && interface.is_point_to_point())
+                            || interface.is_loopback())
+                        {
+                            if interface.is_loopback() {
+                                // The pnet code for BPF loopback adds a zero d out Ethernet header
+                                payload_offset = 14;
+                            } else {
+                                // Maybe is TUN interface
+                                payload_offset = 0;
+                            }
+                            if packet.len() > payload_offset {
+                                let version = Ipv4Packet::new(&packet[payload_offset..])
+                                    .unwrap()
+                                    .get_version();
+                                if version == 4 {
+                                    fake_ethernet_frame.set_destination(MacAddr(0, 0, 0, 0, 0, 0));
+                                    fake_ethernet_frame.set_source(MacAddr(0, 0, 0, 0, 0, 0));
+                                    fake_ethernet_frame.set_ethertype(EtherTypes::Ipv4);
+                                    fake_ethernet_frame.set_payload(&packet[payload_offset..]);
+                                    handle_ethernet_frame(&interface, &fake_ethernet_frame.to_immutable(), packet_info_buffer.clone());
+                                    continue;
+                                } else if version == 6 {
+                                    fake_ethernet_frame.set_destination(MacAddr(0, 0, 0, 0, 0, 0));
+                                    fake_ethernet_frame.set_source(MacAddr(0, 0, 0, 0, 0, 0));
+                                    fake_ethernet_frame.set_ethertype(EtherTypes::Ipv6);
+                                    fake_ethernet_frame.set_payload(&packet[payload_offset..]);
+                                    handle_ethernet_frame(&interface, &fake_ethernet_frame.to_immutable(), packet_info_buffer.clone());
+                                    continue;
+                                }
                             }
                         }
+                        handle_ethernet_frame(&interface, &EthernetPacket::new(packet).unwrap(), packet_info_buffer.clone());
                     }
-                    handle_ethernet_frame(interface, &EthernetPacket::new(packet).unwrap(), self.packet_info_buffer.clone());
+                    Err(e) => panic!("packetdump: unable to receive packet: {}", e),
                 }
-                Err(e) => panic!("packetdump: unable to receive packet: {}", e),
+                if stop_signal.load(Ordering::SeqCst) == true {
+                    println!("Quit successful");
+                    break;
+                }
             }
-        }
+        });
+        Ok(())
     }
 }
 

@@ -6,7 +6,7 @@ use json::JsonValue;
 use serde::{Deserialize, Serialize};
 use std::cell::{Cell, RefCell};
 use std::sync::Arc;
-use net_sniffer::sniffer::IFace;
+use net_sniffer::sniffer::{IFace, Sniffer};
 use std::borrow::{Borrow, BorrowMut};
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -61,20 +61,65 @@ async fn index_mjsonrust(body: web::Bytes) -> Result<HttpResponse, Error> {
         .content_type("application/json")
         .body(injson.dump()))
 }
+#[get("/iface_select/{index}")]
+async fn iface_select(index: web::Path<u32>, data: web::Data<MyData>) -> Result<HttpResponse, Error> {
+    let index = index.0;
+    println!("Get index {}", index);
+    data.sniffer.borrow_mut().start_sniffing(index);
+    Ok(HttpResponse::Ok()
+        .content_type("application/json")
+        .body(json::Null.dump()))
+}
+
 
 #[get("/iface_get")]
 async fn iface_get(mut data: web::Data<MyData>) -> Result<HttpResponse, Error> {
-    data.iface.borrow_mut().change_name("eth2".to_string());
+    let interfaces = data.sniffer.borrow().get_interfaces();
+    let mut iface_json = JsonValue::new_array();
+    for iface in interfaces {
+         iface_json.push(json::object! {
+             "name": iface.get_name(),
+             "index": iface.get_index()
+         });
+    }
     Ok(HttpResponse::Ok()
         .content_type("application/json")
-        .body(json::object! {
-            "Name": data.iface.borrow().get_name(),
-            "index": data.iface.borrow().get_index()
-        }.dump()))
+        .body(iface_json.dump()))
+}
+
+#[get("/packet_update")]
+async fn packet_update(mut data: web::Data<MyData>) -> Result<HttpResponse, Error> {
+    let packets = data.sniffer.borrow_mut().packet_update();
+    let mut packets_json = JsonValue::new_array();
+    for packet in packets {
+        let (iface_name, timestamp, source, destination, protocol, length, description, raw_bytes) = packet.get_inner();
+        packets_json.push(json::object! {
+            "iface_name": iface_name,
+            "timestamp": timestamp,
+            "source": source,
+            "destination": destination,
+            "protocol": protocol,
+            "length": length,
+            "description": description,
+            "raw_bytes": raw_bytes
+       });
+    }
+    Ok(HttpResponse::Ok()
+        .content_type("application/json")
+        .body(packets_json.dump()))
+
+}
+
+#[get("/stop_sniffing")]
+async fn stop_sniffing(mut data: web::Data<MyData>) -> Result<HttpResponse, Error> {
+    let signal = data.sniffer.borrow_mut().packet_update_stop();
+    Ok(HttpResponse::Ok()
+        .content_type("application/json")
+        .body(JsonValue::Boolean(signal).dump()))
 }
 
 struct MyData {
-    iface: RefCell<IFace>,
+    sniffer: RefCell<Sniffer>,
 }
 
 #[actix_web::main]
@@ -85,20 +130,14 @@ async fn main() -> std::io::Result<()> {
     HttpServer::new(|| {
         App::new()
             // enable logger
-            .data(MyData{ iface: RefCell::new(IFace::new("eth0".to_string(), 1))})
+            .data(MyData{ sniffer: RefCell::new(Sniffer::new())})
             .wrap(middleware::Logger::default())
             .wrap(middleware::DefaultHeaders::new().header("Access-Control-Allow-Origin", "*"))
             .data(web::JsonConfig::default().limit(4096)) // <- limit size of the payload (global configuration)
-            .service(web::resource("/extractor").route(web::post().to(index)))
-            .service(
-                web::resource("/extractor2")
-                    .data(web::JsonConfig::default().limit(1024)) // <- limit size of the payload (resource level)
-                    .route(web::post().to(extract_item)),
-            )
-            .service(web::resource("/manual").route(web::post().to(index_manual)))
-            .service(web::resource("/mjsonrust").route(web::post().to(index_mjsonrust)))
-            .service(web::resource("/").route(web::post().to(index)))
             .service(iface_get)
+            .service(iface_select)
+            .service(packet_update)
+            .service(stop_sniffing)
     })
         .bind("127.0.0.1:8080")?
         .run()
